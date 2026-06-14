@@ -1,9 +1,9 @@
 #!/opt/homebrew/bin/python3
 """
-browsershot: wrap an image in a Safari/macOS or iPhone browser screenshot frame.
+browsershot: wrap one or more images in Safari/macOS or iPhone screenshot frames.
 
 Usage:
-  browsershot <sourcefile> --address my.addressbar-value.com --iphone --light --stylized
+  browsershot <sourcefile> [sourcefile ...] --address my.addressbar-value.com --iphone --light --stylized
 """
 
 from __future__ import annotations
@@ -34,14 +34,17 @@ SF_SYMBOLS = {
     "lock_bold": "lock",
 }
 SF_SYMBOL_CACHE: dict[tuple[int, str], dict[str, Image.Image]] = {}
+MASK_KEYS = {"top", "right", "bottom", "left", "x", "y"}
+MASK_OPTIONS = {"--mask": "mask", "--imask": "imask"}
+VALUE_OPTIONS = {"--address", "--left", "--right", "--top", "--bottom", "--output", "-o"}
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="browsershot",
-        description="Wrap any image in a Safari browser or iPhone screenshot frame.",
+        description="Wrap one or more images in Safari browser or iPhone screenshot frames.",
     )
-    parser.add_argument("sourcefile", help="Image to frame")
+    parser.add_argument("sourcefile", nargs="+", help="Image or images to frame")
     parser.add_argument(
         "--address",
         default=DEFAULT_ADDRESS,
@@ -54,13 +57,268 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use a simple line-drawing browser/device style",
     )
+    parser.add_argument(
+        "--mask",
+        metavar="SPEC",
+        nargs="+",
+        help="Crop source images before framing, e.g. --mask bottom:100px left:50%%",
+    )
+    parser.add_argument(
+        "--imask",
+        metavar="SPEC",
+        nargs="+",
+        help="Keep source image regions before framing, e.g. --imask top:720px left:1280px",
+    )
+    horizontal = parser.add_mutually_exclusive_group()
+    horizontal.add_argument(
+        "--left",
+        type=non_negative_int,
+        metavar="PX",
+        help="Place the top browser this many pixels left of the browser behind it",
+    )
+    horizontal.add_argument(
+        "--right",
+        type=non_negative_int,
+        metavar="PX",
+        help="Place the top browser this many pixels right of the browser behind it",
+    )
+    vertical = parser.add_mutually_exclusive_group()
+    vertical.add_argument(
+        "--top",
+        type=non_negative_int,
+        metavar="PX",
+        help="Place the top browser this many pixels above the browser behind it",
+    )
+    vertical.add_argument(
+        "--bottom",
+        type=non_negative_int,
+        metavar="PX",
+        help="Place the top browser this many pixels below the browser behind it",
+    )
     parser.add_argument("--no-shadow", action="store_true", help="Disable the outer browser/device shadow")
     parser.add_argument(
         "-o",
         "--output",
-        help="Optional output path. Defaults to <sourcefile>.safari[-iphone]-<style>-<mode>.png",
+        help="Optional output path. Defaults to <sourcefile>.safari[-stack][-iphone]-<style>-<mode>.png",
     )
-    return parser.parse_args()
+    argv = sys.argv[1:] if argv is None else argv
+    cleaned_argv, source_mask_ops, mask_error = extract_mask_args(argv)
+    if mask_error:
+        parser.error(mask_error)
+
+    args = parser.parse_args(cleaned_argv)
+    if len(source_mask_ops) != len(args.sourcefile):
+        parser.error("--mask placement could not be matched to source files")
+    args.source_mask_ops = source_mask_ops
+    return args
+
+
+def extract_mask_args(argv: list[str]) -> tuple[list[str], list[list[tuple[str, list[str]]]], str | None]:
+    cleaned: list[str] = []
+    global_ops: list[tuple[str, list[str]]] = []
+    source_ops: list[list[tuple[str, list[str]]]] = []
+    last_source_index: int | None = None
+    i = 0
+
+    while i < len(argv):
+        token = argv[i]
+        option = None
+        option_value = None
+        for candidate, kind in MASK_OPTIONS.items():
+            if token == candidate:
+                option = kind
+                break
+            if token.startswith(candidate + "="):
+                option = kind
+                option_value = token.split("=", 1)[1]
+                break
+        if option is not None:
+            specs: list[str] = []
+            if option_value is not None:
+                if option_value:
+                    specs.append(option_value)
+                i += 1
+            else:
+                i += 1
+            while i < len(argv) and not argv[i].startswith("-") and ":" in argv[i]:
+                specs.append(argv[i])
+                i += 1
+            if not specs:
+                return cleaned, source_ops, f"--{option} requires at least one mask spec, such as bottom:100px"
+            if last_source_index is None:
+                global_ops.append((option, specs))
+            else:
+                source_ops[last_source_index].append((option, specs))
+            continue
+
+        cleaned.append(token)
+        if token in VALUE_OPTIONS:
+            if i + 1 < len(argv):
+                i += 1
+                cleaned.append(argv[i])
+        elif token.startswith("--") and "=" in token:
+            pass
+        elif not token.startswith("-"):
+            source_ops.append([(kind, list(specs)) for kind, specs in global_ops])
+            last_source_index = len(source_ops) - 1
+        i += 1
+
+    return cleaned, source_ops, None
+
+
+def non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid pixel value: {value!r}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("pixel value must be 0 or greater")
+    return parsed
+
+
+def mask_amount(value: str, dimension: int) -> int:
+    if value.endswith("%"):
+        number = value[:-1]
+        try:
+            percent = float(number)
+        except ValueError as exc:
+            raise ValueError(f"invalid percentage mask value: {value!r}") from exc
+        if percent < 0:
+            raise ValueError("mask value must be 0 or greater")
+        return round(dimension * percent / 100)
+
+    if value.endswith("px"):
+        value = value[:-2]
+    try:
+        pixels = int(value)
+    except ValueError as exc:
+        raise ValueError(f"invalid pixel mask value: {value!r}") from exc
+    if pixels < 0:
+        raise ValueError("mask value must be 0 or greater")
+    return pixels
+
+
+def parse_mask_spec(spec: str, image: Image.Image) -> tuple[int, int, int, int]:
+    key, separator, value = spec.partition(":")
+    if not separator or not key or not value:
+        raise ValueError(f"invalid mask spec: {spec!r}")
+    if key not in MASK_KEYS:
+        raise ValueError(f"invalid mask edge {key!r}; expected one of {', '.join(sorted(MASK_KEYS))}")
+
+    if key in {"left", "right", "x"}:
+        amount = mask_amount(value, image.width)
+    else:
+        amount = mask_amount(value, image.height)
+
+    if key == "top":
+        return (0, amount, 0, 0)
+    if key == "right":
+        return (0, 0, amount, 0)
+    if key == "bottom":
+        return (0, 0, 0, amount)
+    if key == "left":
+        return (amount, 0, 0, 0)
+    if key == "x":
+        return (amount, 0, amount, 0)
+    return (0, amount, 0, amount)
+
+
+def crop_keep_non_empty(image: Image.Image, left: int, top: int, right: int, bottom: int) -> Image.Image:
+    left = max(0, min(image.width - 1, left))
+    top = max(0, min(image.height - 1, top))
+    right = max(left + 1, min(image.width, right))
+    bottom = max(top + 1, min(image.height, bottom))
+    return image.crop((left, top, right, bottom))
+
+
+def apply_masks(image: Image.Image, specs: list[str]) -> Image.Image:
+    if not specs:
+        return image
+
+    left = top = right = bottom = 0
+    for spec in specs:
+        add_left, add_top, add_right, add_bottom = parse_mask_spec(spec, image)
+        left += add_left
+        top += add_top
+        right += add_right
+        bottom += add_bottom
+
+    if left + right >= image.width:
+        overflow = left + right - image.width + 1
+        if right >= overflow:
+            right -= overflow
+        else:
+            left = max(0, left - (overflow - right))
+            right = 0
+    if top + bottom >= image.height:
+        overflow = top + bottom - image.height + 1
+        if bottom >= overflow:
+            bottom -= overflow
+        else:
+            top = max(0, top - (overflow - bottom))
+            bottom = 0
+
+    return crop_keep_non_empty(image, left, top, image.width - right, image.height - bottom)
+
+
+def parse_inverse_mask_spec(spec: str, image: Image.Image) -> tuple[int | None, int | None, int | None, int | None]:
+    key, separator, value = spec.partition(":")
+    if not separator or not key or not value:
+        raise ValueError(f"invalid inverse mask spec: {spec!r}")
+    if key not in MASK_KEYS:
+        raise ValueError(f"invalid inverse mask edge {key!r}; expected one of {', '.join(sorted(MASK_KEYS))}")
+
+    if key in {"left", "right", "x"}:
+        amount = mask_amount(value, image.width)
+    else:
+        amount = mask_amount(value, image.height)
+
+    if key == "top":
+        return (None, 0, None, amount)
+    if key == "right":
+        return (image.width - amount, None, image.width, None)
+    if key == "bottom":
+        return (None, image.height - amount, None, image.height)
+    if key == "left":
+        return (0, None, amount, None)
+    if key == "x":
+        inset = max(0, round((image.width - amount) / 2))
+        return (inset, None, inset + amount, None)
+    inset = max(0, round((image.height - amount) / 2))
+    return (None, inset, None, inset + amount)
+
+
+def apply_inverse_masks(image: Image.Image, specs: list[str]) -> Image.Image:
+    if not specs:
+        return image
+
+    left = 0
+    top = 0
+    right = image.width
+    bottom = image.height
+    for spec in specs:
+        keep_left, keep_top, keep_right, keep_bottom = parse_inverse_mask_spec(spec, image)
+        if keep_left is not None:
+            left = max(left, keep_left)
+        if keep_top is not None:
+            top = max(top, keep_top)
+        if keep_right is not None:
+            right = min(right, keep_right)
+        if keep_bottom is not None:
+            bottom = min(bottom, keep_bottom)
+
+    return crop_keep_non_empty(image, left, top, right, bottom)
+
+
+def apply_mask_ops(image: Image.Image, ops: list[tuple[str, list[str]]]) -> Image.Image:
+    for kind, specs in ops:
+        if kind == "mask":
+            image = apply_masks(image, specs)
+        elif kind == "imask":
+            image = apply_inverse_masks(image, specs)
+        else:
+            raise ValueError(f"unknown mask operation: {kind}")
+    return image
 
 
 def color(hex_value: str) -> tuple[int, int, int, int]:
@@ -550,8 +808,33 @@ def draw_iphone(source: Image.Image, address: str, light: bool, stylized: bool, 
     return out
 
 
-def default_output(source: Path, iphone: bool, stylized: bool, light: bool) -> Path:
+def stack_offset(args: argparse.Namespace) -> tuple[int, int]:
+    offset_x = -args.left if args.left is not None else args.right
+    offset_y = -args.top if args.top is not None else args.bottom
+    return 80 if offset_x is None else offset_x, 50 if offset_y is None else offset_y
+
+
+def stack_frames(frames: list[Image.Image], offset_x: int, offset_y: int) -> Image.Image:
+    if len(frames) == 1:
+        return frames[0]
+
+    raw_positions = [(index * -offset_x, index * -offset_y) for index in range(len(frames))]
+    min_x = min(x for x, _y in raw_positions)
+    min_y = min(y for _x, y in raw_positions)
+    positions = [(x - min_x, y - min_y) for x, y in raw_positions]
+    width = max(x + frame.width for frame, (x, _y) in zip(frames, positions))
+    height = max(y + frame.height for frame, (_x, y) in zip(frames, positions))
+    out = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+
+    for frame, position in reversed(list(zip(frames, positions))):
+        out.alpha_composite(frame, position)
+    return out
+
+
+def default_output(source: Path, stacked: bool, iphone: bool, stylized: bool, light: bool) -> Path:
     parts = ["safari"]
+    if stacked:
+        parts.append("stack")
     if iphone:
         parts.append("iphone")
     parts.append("stylized" if stylized else "realistic")
@@ -561,23 +844,37 @@ def default_output(source: Path, iphone: bool, stylized: bool, light: bool) -> P
 
 def main() -> int:
     args = parse_args()
-    source_path = Path(args.sourcefile)
-    if not source_path.exists():
-        print(f"browsershot: source file not found: {source_path}", file=sys.stderr)
-        return 2
+    source_paths = [Path(sourcefile) for sourcefile in args.sourcefile]
+    for source_path in source_paths:
+        if not source_path.exists():
+            print(f"browsershot: source file not found: {source_path}", file=sys.stderr)
+            return 2
 
-    try:
-        source = Image.open(source_path).convert("RGBA")
-    except Exception as exc:
-        print(f"browsershot: could not open image: {exc}", file=sys.stderr)
-        return 2
+    frames = []
+    for source_path, mask_ops in zip(source_paths, args.source_mask_ops):
+        try:
+            source = Image.open(source_path).convert("RGBA")
+        except Exception as exc:
+            print(f"browsershot: could not open image {source_path}: {exc}", file=sys.stderr)
+            return 2
+        try:
+            source = apply_mask_ops(source, mask_ops)
+        except ValueError as exc:
+            print(f"browsershot: invalid mask for {source_path}: {exc}", file=sys.stderr)
+            return 2
 
-    framed = (
-        draw_iphone(source, args.address, args.light, args.stylized, not args.no_shadow)
-        if args.iphone
-        else draw_safari(source, args.address, args.light, args.stylized, not args.no_shadow)
+        frames.append(
+            draw_iphone(source, args.address, args.light, args.stylized, not args.no_shadow)
+            if args.iphone
+            else draw_safari(source, args.address, args.light, args.stylized, not args.no_shadow)
+        )
+
+    framed = stack_frames(frames, *stack_offset(args))
+    output_path = (
+        Path(args.output)
+        if args.output
+        else default_output(source_paths[0], len(source_paths) > 1, args.iphone, args.stylized, args.light)
     )
-    output_path = Path(args.output) if args.output else default_output(source_path, args.iphone, args.stylized, args.light)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     framed.save(output_path)
     print(output_path)

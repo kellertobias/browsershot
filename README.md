@@ -14,6 +14,7 @@ Defaults:
 - shadows are included unless `--no-shadow` is passed
 - when multiple source files are passed, browsers are stacked with the first image on top
 - stacked browsers default to `--right 80 --bottom 50`, placing the top browser 80px right and 50px below the browser behind it
+- `--scale <percent>` scales each background browser and stack offset down per stack level, leaving the top browser at full size
 - `--left <px>` and `--right <px>` are mutually exclusive
 - `--top <px>` and `--bottom <px>` are mutually exclusive
 - masks crop source images before the browser frame is generated
@@ -23,6 +24,7 @@ Stack top-browser direction and spacing:
 
 ```sh
 ./browsershot first.png second.png third.png --left 40 --top 24
+./browsershot first.png second.png third.png --scale 5%
 ```
 
 Masking:

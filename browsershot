@@ -36,7 +36,7 @@ SF_SYMBOLS = {
 SF_SYMBOL_CACHE: dict[tuple[int, str], dict[str, Image.Image]] = {}
 MASK_KEYS = {"top", "right", "bottom", "left", "x", "y"}
 MASK_OPTIONS = {"--mask": "mask", "--imask": "imask"}
-VALUE_OPTIONS = {"--address", "--left", "--right", "--top", "--bottom", "--cursor", "--overlay", "--output", "-o"}
+VALUE_OPTIONS = {"--address", "--left", "--right", "--top", "--bottom", "--scale", "--cursor", "--overlay", "--output", "-o"}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -108,6 +108,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=non_negative_int,
         metavar="PX",
         help="Place the top browser this many pixels below the browser behind it",
+    )
+    parser.add_argument(
+        "--scale",
+        type=scale_down_fraction,
+        default=0.0,
+        metavar="PERCENT",
+        help="Scale each background browser down by this percentage per stack level, e.g. --scale 5%%",
     )
     parser.add_argument("--no-shadow", action="store_true", help="Disable the outer browser/device shadow")
     parser.add_argument(
@@ -188,6 +195,26 @@ def non_negative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("pixel value must be 0 or greater")
     return parsed
+
+
+def scale_down_fraction(value: str) -> float:
+    raw_value = value
+    if value.endswith("%"):
+        value = value[:-1]
+        try:
+            fraction = float(value) / 100
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid scale percentage: {raw_value!r}") from exc
+    else:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid scale percentage: {raw_value!r}") from exc
+        fraction = parsed / 100 if parsed > 1 else parsed
+
+    if fraction < 0 or fraction >= 1:
+        raise argparse.ArgumentTypeError("scale must be at least 0% and less than 100%")
+    return fraction
 
 
 def parse_point(value: str, label: str) -> tuple[int, int]:
@@ -968,11 +995,39 @@ def stack_offset(args: argparse.Namespace) -> tuple[int, int]:
     return 80 if offset_x is None else offset_x, 50 if offset_y is None else offset_y
 
 
-def stack_frames(frames: list[Image.Image], offset_x: int, offset_y: int) -> tuple[Image.Image, list[tuple[int, int]]]:
+def scale_stack_frames(frames: list[Image.Image], scale_down: float) -> list[Image.Image]:
+    if scale_down == 0 or len(frames) == 1:
+        return frames
+
+    scaled_frames = []
+    level_factor = 1 - scale_down
+    for index, frame in enumerate(frames):
+        factor = level_factor**index
+        if factor == 1:
+            scaled_frames.append(frame)
+            continue
+        size = (max(1, round(frame.width * factor)), max(1, round(frame.height * factor)))
+        scaled_frames.append(frame.resize(size, Image.Resampling.LANCZOS))
+    return scaled_frames
+
+
+def stack_frames(
+    frames: list[Image.Image],
+    offset_x: int,
+    offset_y: int,
+    scale_down: float = 0.0,
+) -> tuple[Image.Image, list[tuple[int, int]]]:
     if len(frames) == 1:
         return frames[0], [(0, 0)]
 
-    raw_positions = [(index * -offset_x, index * -offset_y) for index in range(len(frames))]
+    level_factor = 1 - scale_down
+    raw_positions = [(0, 0)]
+    x = y = 0.0
+    for index in range(1, len(frames)):
+        step_scale = level_factor ** (index - 1)
+        x += -offset_x * step_scale
+        y += -offset_y * step_scale
+        raw_positions.append((round(x), round(y)))
     min_x = min(x for x, _y in raw_positions)
     min_y = min(y for _x, y in raw_positions)
     positions = [(x - min_x, y - min_y) for x, y in raw_positions]
@@ -1030,7 +1085,8 @@ def main() -> int:
             else draw_safari(source, args.address, args.light, args.stylized, shadow)
         )
 
-    framed, frame_positions = stack_frames(frames, *stack_offset(args))
+    frames = scale_stack_frames(frames, args.scale)
+    framed, frame_positions = stack_frames(frames, *stack_offset(args), scale_down=args.scale)
     top_source_origin, top_source_scale = source_transforms[0]
     top_frame_position = frame_positions[0]
     top_source_origin = (top_source_origin[0] + top_frame_position[0], top_source_origin[1] + top_frame_position[1])

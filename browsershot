@@ -1,0 +1,588 @@
+#!/opt/homebrew/bin/python3
+"""
+browsershot: wrap an image in a Safari/macOS or iPhone browser screenshot frame.
+
+Usage:
+  browsershot <sourcefile> --address my.addressbar-value.com --iphone --light --stylized
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+
+DEFAULT_ADDRESS = "example.com"
+SF_SYMBOLS = {
+    "sidebar": "sidebar.left",
+    "down": "chevron.down",
+    "back": "chevron.left",
+    "forward": "chevron.right",
+    "download": "arrow.down.circle",
+    "share": "square.and.arrow.up",
+    "plus": "plus",
+    "tabs": "square.on.square",
+    "reload": "arrow.clockwise",
+    "lock": "lock",
+    "lock_bold": "lock",
+}
+SF_SYMBOL_CACHE: dict[tuple[int, str], dict[str, Image.Image]] = {}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="browsershot",
+        description="Wrap any image in a Safari browser or iPhone screenshot frame.",
+    )
+    parser.add_argument("sourcefile", help="Image to frame")
+    parser.add_argument(
+        "--address",
+        default=DEFAULT_ADDRESS,
+        help=f"Address bar text. Defaults to {DEFAULT_ADDRESS!r}.",
+    )
+    parser.add_argument("--iphone", action="store_true", help="Render inside an iPhone frame")
+    parser.add_argument("--light", action="store_true", help="Use light mode. Default is dark mode")
+    parser.add_argument(
+        "--stylized",
+        action="store_true",
+        help="Use a simple line-drawing browser/device style",
+    )
+    parser.add_argument("--no-shadow", action="store_true", help="Disable the outer browser/device shadow")
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Optional output path. Defaults to <sourcefile>.safari[-iphone]-<style>-<mode>.png",
+    )
+    return parser.parse_args()
+
+
+def color(hex_value: str) -> tuple[int, int, int, int]:
+    hex_value = hex_value.strip("#")
+    if len(hex_value) == 6:
+        return tuple(int(hex_value[i : i + 2], 16) for i in (0, 2, 4)) + (255,)
+    if len(hex_value) == 8:
+        return tuple(int(hex_value[i : i + 2], 16) for i in (0, 2, 4, 6))
+    raise ValueError(f"Invalid color: {hex_value}")
+
+
+def with_alpha(rgba: tuple[int, int, int, int], alpha_factor: float) -> tuple[int, int, int, int]:
+    return (rgba[0], rgba[1], rgba[2], max(0, min(255, round(rgba[3] * alpha_factor))))
+
+
+def font(size: int, bold: bool = False, variation: str | None = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold or variation else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial Bold.ttf" if bold or variation else "/Library/Fonts/Arial.ttf",
+    ]
+    for candidate in candidates:
+        try:
+            loaded = ImageFont.truetype(candidate, size=size)
+            if variation and hasattr(loaded, "set_variation_by_name"):
+                try:
+                    loaded.set_variation_by_name(variation)
+                except OSError:
+                    pass
+            return loaded
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+def rounded_mask(size: tuple[int, int], radius: int) -> Image.Image:
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle((0, 0, size[0] - 1, size[1] - 1), radius=radius, fill=255)
+    return mask
+
+
+def cover_resize(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+    target_w, target_h = size
+    scale = max(target_w / image.width, target_h / image.height)
+    new_size = (max(1, math.ceil(image.width * scale)), max(1, math.ceil(image.height * scale)))
+    resized = image.resize(new_size, Image.Resampling.LANCZOS)
+    left = (resized.width - target_w) // 2
+    top = (resized.height - target_h) // 2
+    return resized.crop((left, top, left + target_w, top + target_h))
+
+
+def contain_resize(image: Image.Image, max_size: tuple[int, int], background: tuple[int, int, int, int]) -> Image.Image:
+    scale = min(max_size[0] / image.width, max_size[1] / image.height)
+    new_size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+    resized = image.resize(new_size, Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", max_size, background)
+    canvas.alpha_composite(resized, ((max_size[0] - resized.width) // 2, (max_size[1] - resized.height) // 2))
+    return canvas
+
+
+def render_sf_symbol_masks(point_size: int) -> dict[str, Image.Image]:
+    cache_key = (point_size, sys.platform)
+    if cache_key in SF_SYMBOL_CACHE:
+        return SF_SYMBOL_CACHE[cache_key]
+    if sys.platform != "darwin":
+        SF_SYMBOL_CACHE[cache_key] = {}
+        return {}
+
+    cache_dir = Path(tempfile.gettempdir()) / "browsershot-sf-symbols" / f"pt-{point_size}"
+    def load_mask(path: Path) -> Image.Image:
+        image = Image.open(path).convert("RGBA")
+        bounds = image.getchannel("A").getbbox()
+        if bounds is None:
+            return image
+        pad = max(2, point_size // 18)
+        x0 = max(0, bounds[0] - pad)
+        y0 = max(0, bounds[1] - pad)
+        x1 = min(image.width, bounds[2] + pad)
+        y1 = min(image.height, bounds[3] + pad)
+        return image.crop((x0, y0, x1, y1))
+
+    if all((cache_dir / f"{key}.png").exists() for key in SF_SYMBOLS):
+        masks = {key: load_mask(cache_dir / f"{key}.png") for key in SF_SYMBOLS}
+        SF_SYMBOL_CACHE[cache_key] = masks
+        return masks
+
+    swift_source = """
+import AppKit
+import Foundation
+
+let args = CommandLine.arguments
+let outDir = URL(fileURLWithPath: args[1], isDirectory: true)
+let pointSize = Double(args[2])!
+let defaultConfig = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium, scale: .medium)
+let boldConfig = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .bold, scale: .medium)
+let canvas = Int(ceil(pointSize * 1.8))
+
+for i in stride(from: 3, to: args.count, by: 2) {
+    let key = args[i]
+    let name = args[i + 1]
+    let config = key == "lock_bold" ? boldConfig : defaultConfig
+    guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil),
+          let image = base.withSymbolConfiguration(config) else { continue }
+
+    let output = NSImage(size: NSSize(width: canvas, height: canvas))
+    output.lockFocus()
+    NSColor.clear.setFill()
+    NSRect(x: 0, y: 0, width: canvas, height: canvas).fill()
+    NSColor.black.set()
+    let rect = NSRect(
+        x: (Double(canvas) - pointSize) / 2.0,
+        y: (Double(canvas) - pointSize) / 2.0,
+        width: pointSize,
+        height: pointSize
+    )
+    image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
+    output.unlockFocus()
+
+    guard let tiff = output.tiffRepresentation,
+          let bitmap = NSBitmapImageRep(data: tiff),
+          let png = bitmap.representation(using: .png, properties: [:]) else { continue }
+    try? png.write(to: outDir.appendingPathComponent("\\(key).png"))
+}
+"""
+
+    masks: dict[str, Image.Image] = {}
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="browsershot-symbols-build-") as tmp:
+        tmp_path = Path(tmp)
+        script_path = tmp_path / "render_symbols.swift"
+        script_path.write_text(swift_source)
+        cmd = ["swift", str(script_path), str(cache_dir), str(point_size)]
+        for key, symbol_name in SF_SYMBOLS.items():
+            cmd.extend([key, symbol_name])
+        env = os.environ.copy()
+        env["CLANG_MODULE_CACHE_PATH"] = str(Path(tempfile.gettempdir()) / "browsershot-swift-module-cache")
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=60)
+            for key in SF_SYMBOLS:
+                icon_path = cache_dir / f"{key}.png"
+                if icon_path.exists():
+                    masks[key] = load_mask(icon_path)
+        except (OSError, subprocess.SubprocessError):
+            masks = {}
+
+    SF_SYMBOL_CACHE[cache_key] = masks
+    return masks
+
+
+def paste_masked_icon(
+    base: Image.Image,
+    masks: dict[str, Image.Image],
+    key: str,
+    center: tuple[float, float],
+    size: float | tuple[float, float],
+    fill,
+    scale: int,
+) -> bool:
+    mask = masks.get(key)
+    if mask is None:
+        return False
+    if isinstance(size, tuple):
+        target_size = (max(1, round(size[0] * scale)), max(1, round(size[1] * scale)))
+    else:
+        target = max(1, round(size * scale))
+        target_size = (target, target)
+    icon = mask.resize(target_size, Image.Resampling.LANCZOS)
+    alpha = icon.getchannel("A")
+    fill_layer = Image.new("RGBA", icon.size, fill)
+    pos = (round(center[0] * scale - target_size[0] / 2), round(center[1] * scale - target_size[1] / 2))
+    base.paste(fill_layer, pos, alpha)
+    return True
+
+
+def add_shadow(
+    base: Image.Image,
+    frame_rect: tuple[int, int, int, int],
+    radius: int,
+    opacity: int,
+    blur: int,
+    y_offset: int,
+) -> None:
+    x0, y0, x1, y1 = frame_rect
+    shadow = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    shape = Image.new("L", (x1 - x0, y1 - y0), 0)
+    ImageDraw.Draw(shape).rounded_rectangle((0, 0, x1 - x0 - 1, y1 - y0 - 1), radius=radius, fill=opacity)
+    shadow.paste(Image.new("RGBA", shape.size, (0, 0, 0, 255)), (x0, y0 + y_offset), shape)
+    base.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(blur)))
+
+
+def text_fit(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    size: int,
+    fill,
+    anchor_xy,
+    anchor="mm",
+    variation: str | None = None,
+) -> None:
+    current = text
+    text_font = font(size, variation=variation)
+    if draw.textlength(current, font=text_font) <= max_width:
+        draw.text(anchor_xy, current, font=text_font, fill=fill, anchor=anchor)
+        return
+    ellipsis = "..."
+    while current and draw.textlength(current + ellipsis, font=text_font) > max_width:
+        current = current[:-1]
+    draw.text(anchor_xy, current + ellipsis, font=text_font, fill=fill, anchor=anchor)
+
+
+def draw_icon(draw: ImageDraw.ImageDraw, kind: str, box: tuple[int, int, int, int], fill, width: int = 2) -> None:
+    x0, y0, x1, y1 = box
+    w = x1 - x0
+    h = y1 - y0
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    if kind == "back":
+        draw.line((x0 + w * 0.68, y0 + h * 0.18, x0 + w * 0.28, cy, x0 + w * 0.68, y0 + h * 0.82), fill=fill, width=width, joint="curve")
+    elif kind == "forward":
+        draw.line((x0 + w * 0.32, y0 + h * 0.18, x0 + w * 0.72, cy, x0 + w * 0.32, y0 + h * 0.82), fill=fill, width=width, joint="curve")
+    elif kind == "share":
+        draw.rounded_rectangle((x0 + w * 0.24, y0 + h * 0.42, x1 - w * 0.24, y1 - h * 0.12), radius=max(2, width * 1.4), outline=fill, width=width)
+        draw.line((cx, y0 + h * 0.16, cx, y0 + h * 0.64), fill=fill, width=width)
+        draw.line((cx, y0 + h * 0.16, cx - w * 0.18, y0 + h * 0.34), fill=fill, width=width)
+        draw.line((cx, y0 + h * 0.16, cx + w * 0.18, y0 + h * 0.34), fill=fill, width=width)
+    elif kind == "tabs":
+        draw.rounded_rectangle((x0 + w * 0.34, y0 + h * 0.18, x1 - w * 0.08, y1 - h * 0.34), radius=max(2, width * 1.2), outline=fill, width=width)
+        draw.rounded_rectangle((x0 + w * 0.08, y0 + h * 0.34, x1 - w * 0.34, y1 - h * 0.08), radius=max(2, width * 1.2), outline=fill, width=width)
+    elif kind == "plus":
+        draw.line((cx, y0 + h * 0.22, cx, y1 - h * 0.22), fill=fill, width=width)
+        draw.line((x0 + w * 0.22, cy, x1 - w * 0.22, cy), fill=fill, width=width)
+    elif kind == "down":
+        draw.line((x0 + w * 0.28, y0 + h * 0.36, cx, y0 + h * 0.66, x0 + w * 0.72, y0 + h * 0.36), fill=fill, width=width, joint="curve")
+
+
+def draw_icon_scaled(
+    draw: ImageDraw.ImageDraw,
+    kind: str,
+    box: tuple[float, float, float, float],
+    fill,
+    scale: int,
+    width: float = 1.6,
+) -> None:
+    scaled = tuple(round(value * scale) for value in box)
+    draw_icon(draw, kind, scaled, fill, max(1, round(width * scale)))
+
+
+def draw_safari_sidebar_icon(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], fill, width: int) -> None:
+    x0, y0, x1, y1 = box
+    draw.rounded_rectangle((x0, y0, x1, y1), radius=max(2, width), outline=fill, width=width)
+    split = x0 + round((x1 - x0) * 0.36)
+    draw.line((split, y0 + width, split, y1 - width), fill=fill, width=width)
+    draw.line((x0 + width, y0 + round((y1 - y0) * 0.32), split, y0 + round((y1 - y0) * 0.32)), fill=fill, width=width)
+    draw.line((x0 + width, y0 + round((y1 - y0) * 0.62), split, y0 + round((y1 - y0) * 0.62)), fill=fill, width=width)
+
+
+def draw_reload_icon(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], fill, width: int) -> None:
+    x0, y0, x1, y1 = box
+    draw.arc((x0 + width, y0 + width, x1 - width, y1 - width), 40, 330, fill=fill, width=width)
+    draw.line((x1 - 5 * width, y0 + 3 * width, x1 - width, y0 + 4 * width), fill=fill, width=width)
+    draw.line((x1 - 5 * width, y0 + 3 * width, x1 - 4 * width, y0 + 7 * width), fill=fill, width=width)
+
+
+def draw_download_icon(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], fill, width: int) -> None:
+    x0, y0, x1, y1 = box
+    cx = (x0 + x1) // 2
+    draw.ellipse((x0, y0, x1, y1), outline=fill, width=width)
+    draw.line((cx, y0 + 5 * width, cx, y1 - 6 * width), fill=fill, width=width)
+    draw.line((cx, y1 - 6 * width, cx - 3 * width, y1 - 9 * width), fill=fill, width=width)
+    draw.line((cx, y1 - 6 * width, cx + 3 * width, y1 - 9 * width), fill=fill, width=width)
+
+
+def draw_safari_icon_scaled(
+    draw: ImageDraw.ImageDraw,
+    kind: str,
+    box: tuple[float, float, float, float],
+    fill,
+    scale: int,
+    width: float = 1.15,
+) -> None:
+    scaled = tuple(round(value * scale) for value in box)
+    line_width = max(1, round(width * scale))
+    if kind == "sidebar":
+        draw_safari_sidebar_icon(draw, scaled, fill, line_width)
+    elif kind == "reload":
+        draw_reload_icon(draw, scaled, fill, line_width)
+    elif kind == "download":
+        draw_download_icon(draw, scaled, fill, line_width)
+    else:
+        draw_icon(draw, kind, scaled, fill, line_width)
+
+
+def scaled_rounded_mask(size: tuple[int, int], radius: int, scale: int) -> Image.Image:
+    high = Image.new("L", (size[0] * scale, size[1] * scale), 0)
+    draw = ImageDraw.Draw(high)
+    draw.rounded_rectangle((0, 0, high.width - 1, high.height - 1), radius=radius * scale, fill=255)
+    return high
+
+
+def safari_content_mask(frame_w: int, frame_h: int, toolbar_h: int, radius: int, scale: int) -> Image.Image:
+    frame_mask = scaled_rounded_mask((frame_w, frame_h), radius, scale)
+    return frame_mask.crop((0, toolbar_h * scale, frame_w * scale, frame_h * scale))
+
+
+def draw_safari(source: Image.Image, address: str, light: bool, stylized: bool, shadow: bool) -> Image.Image:
+    scale = 4
+    sf_masks = {} if stylized else render_sf_symbol_masks(18 * scale)
+    viewport_w = max(900, min(1800, source.width))
+    viewport_h = round(viewport_w * source.height / source.width)
+    viewport_h = max(520, min(1200, viewport_h))
+    toolbar_h = 64 if stylized else 54
+    frame_w = viewport_w
+    frame_h = viewport_h + toolbar_h
+    radius = 24 if stylized else 24
+    margin = 84 if shadow else 28
+    out = Image.new("RGBA", ((frame_w + margin * 2) * scale, (frame_h + margin * 2) * scale), (0, 0, 0, 0))
+
+    def p(value: float) -> int:
+        return round(value * scale)
+
+    def r(rectangle: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+        return tuple(p(value) for value in rectangle)
+
+    rect = r((margin, margin, margin + frame_w, margin + frame_h))
+
+    if shadow:
+        add_shadow(out, rect, radius * scale, 76 if light else 130, 28 * scale, 16 * scale)
+
+    draw = ImageDraw.Draw(out)
+    if stylized:
+        paper = color("fbfbf8") if light else color("121417")
+        ink = color("20242a") if light else color("e9eef4")
+        muted = color("737780") if light else color("a4abb4")
+        toolbar = paper
+        page_bg = color("ffffff") if light else color("0d0f12")
+        draw.rounded_rectangle(rect, radius=p(radius), fill=paper, outline=ink, width=p(1.4))
+        draw.line(r((margin, margin + toolbar_h, margin + frame_w, margin + toolbar_h)), fill=ink, width=p(1.4))
+        content = contain_resize(source, (viewport_w * scale, viewport_h * scale), page_bg)
+        content_mask = safari_content_mask(frame_w, frame_h, toolbar_h, radius, scale)
+        out.paste(content, (p(margin), p(margin + toolbar_h)), content_mask)
+        address_w = min(560, max(430, int(frame_w * 0.42)))
+        address_box = (margin + (frame_w - address_w) / 2, margin + 14, margin + (frame_w + address_w) / 2, margin + 50)
+        address_outline = (ink[0], ink[1], ink[2], round(ink[3] * 0.7))
+        draw.rounded_rectangle(r(address_box), radius=p(18), fill=toolbar, outline=address_outline, width=p(1.05))
+        text_fit(
+            draw,
+            address,
+            p(address_w - 58),
+            p(12.5),
+            ink,
+            (p((address_box[0] + address_box[2]) / 2), p(margin + 32)),
+        )
+        dot_y = margin + toolbar_h / 2
+        for i, c in enumerate(("ff6159", "ffbd2e", "28c840")):
+            dot = (margin + 20 + i * 24, dot_y - 7.5, margin + 35 + i * 24, dot_y + 7.5)
+            draw.ellipse(r(dot), outline=ink, width=p(1.0), fill=color(c) if light else None)
+        draw.rounded_rectangle(rect, radius=p(radius), outline=ink, width=p(1.4))
+        return out.resize((out.width // scale, out.height // scale), Image.Resampling.LANCZOS)
+
+    frame_fill = color("f5f5f7") if light else color("202124")
+    toolbar_fill = color("f9f9fa") if light else color("15181d")
+    stroke = color("d3d7de") if light else color("343941")
+    control_fill = color("e5e8ed") if light else color("20252c")
+    control_outline = color("cbd0d8") if light else color("303640")
+    address_fill = color("ffffff") if light else color("11151b")
+    address_text = with_alpha(color("2d3138") if light else color("f1f3f5"), 0.8)
+    icon_fill = color("68707c") if light else color("bec5cf")
+    disabled_icon = color("9ca3ae") if light else color("565d68")
+    page_bg = color("ffffff") if light else color("101114")
+
+    draw.rounded_rectangle(rect, radius=p(radius), fill=frame_fill, outline=stroke, width=p(1))
+    draw.rounded_rectangle(r((margin, margin, margin + frame_w, margin + toolbar_h + radius)), radius=p(radius), fill=toolbar_fill)
+    draw.rectangle(r((margin, margin + toolbar_h - 1, margin + frame_w, margin + toolbar_h + radius)), fill=toolbar_fill)
+    draw.line(r((margin, margin + toolbar_h, margin + frame_w, margin + toolbar_h)), fill=stroke, width=p(1))
+
+    content = contain_resize(source, (viewport_w * scale, viewport_h * scale), page_bg)
+    content_mask = safari_content_mask(frame_w, frame_h, toolbar_h, radius, scale)
+    out.paste(content, (p(margin), p(margin + toolbar_h)), content_mask)
+
+    dot_y = margin + toolbar_h / 2
+    for i, c in enumerate(("ff5f57", "febc2e", "28c840")):
+        draw.ellipse(r((margin + 20 + i * 25, dot_y - 7.5, margin + 35 + i * 25, dot_y + 7.5)), fill=color(c))
+
+    sidebar_pill = (margin + 107, margin + 9, margin + 169, margin + 45)
+    draw.rounded_rectangle(r(sidebar_pill), radius=p(18), fill=control_fill, outline=control_outline, width=p(0.8))
+    if not paste_masked_icon(out, sf_masks, "sidebar", (sidebar_pill[0] + 23, margin + 27), (21, 16), icon_fill, scale):
+        draw_safari_icon_scaled(draw, "sidebar", (sidebar_pill[0] + 15, margin + 21, sidebar_pill[0] + 29, margin + 33), icon_fill, scale, 0.95)
+    if not paste_masked_icon(out, sf_masks, "down", (sidebar_pill[2] - 15, margin + 27), (9, 5), icon_fill, scale):
+        draw_icon_scaled(draw, "down", (sidebar_pill[2] - 24, margin + 22, sidebar_pill[2] - 13, margin + 33), icon_fill, scale, 0.9)
+
+    nav_pill = (margin + 179, margin + 9, margin + 251, margin + 45)
+    draw.rounded_rectangle(r(nav_pill), radius=p(18), fill=control_fill, outline=control_outline, width=p(0.8))
+    for idx, kind in enumerate(("back", "forward")):
+        fill = icon_fill if idx == 0 else disabled_icon
+        center = (nav_pill[0] + 19.5 + idx * 32, margin + 27) if idx == 0 else (nav_pill[0] + 16.5 + idx * 35, margin + 27)
+        if not paste_masked_icon(out, sf_masks, kind, center, (10.2, 17), fill, scale):
+            draw_safari_icon_scaled(draw, kind, (nav_pill[0] + 18 + idx * 31, margin + 20, nav_pill[0] + 31 + idx * 31, margin + 34), fill, scale, 0.95)
+    draw.line(r((nav_pill[0] + 37, margin + 16, nav_pill[0] + 37, margin + 38)), fill=control_outline, width=p(0.7))
+
+    address_w = min(560, max(440, int(frame_w * 0.42)))
+    address_box = (margin + (frame_w - address_w) / 2, margin + 8, margin + (frame_w + address_w) / 2, margin + 46)
+    draw.rounded_rectangle(r(address_box), radius=p(19), fill=address_fill, outline=control_outline, width=p(0.85))
+    lock_x = address_box[0] + 20
+    lock_fill = color("1f9d45") if not light else color("1d7f35")
+    if not paste_masked_icon(out, sf_masks, "lock_bold", (lock_x + 1, margin + 27), (11, 14), lock_fill, scale):
+        draw.rounded_rectangle(r((lock_x - 4, margin + 25, lock_x + 5, margin + 35)), radius=p(1.8), outline=icon_fill, width=p(0.8))
+        draw.arc(r((lock_x - 4, margin + 19, lock_x + 5, margin + 31)), 180, 360, fill=icon_fill, width=p(0.8))
+    if not paste_masked_icon(out, sf_masks, "reload", (address_box[2] - 18, margin + 27), 13, with_alpha(icon_fill, 0.9), scale):
+        draw_safari_icon_scaled(draw, "reload", (address_box[2] - 25, margin + 19, address_box[2] - 11, margin + 35), icon_fill, scale, 0.65)
+    text_fit(
+        draw,
+        address,
+        p(address_w - 96),
+        p(13.8),
+        address_text,
+        (p((address_box[0] + address_box[2]) / 2), p(margin + 27)),
+        variation="Semibold",
+    )
+
+    right_pill = (margin + frame_w - 121, margin + 9, margin + frame_w - 7, margin + 45)
+    draw.rounded_rectangle(r(right_pill), radius=p(18), fill=control_fill, outline=control_outline, width=p(0.8))
+    right_icons = (
+        ("share", right_pill[0] + 25, (13.5, 18)),
+        ("plus", right_pill[0] + 57, 15),
+        ("tabs", right_pill[0] + 89.5, 16),
+    )
+    fallback_boxes = {
+        "share": (right_pill[0] + 17, margin + 18, right_pill[0] + 33, margin + 36),
+        "plus": (right_pill[0] + 52, margin + 21, right_pill[0] + 65, margin + 33),
+        "tabs": (right_pill[0] + 84, margin + 20, right_pill[0] + 99, margin + 34),
+    }
+    for key, x_center, size in right_icons:
+        if not paste_masked_icon(out, sf_masks, key, (x_center, margin + 27), size, icon_fill, scale):
+            draw_safari_icon_scaled(draw, key, fallback_boxes[key], icon_fill, scale, 0.9)
+    draw.rounded_rectangle(rect, radius=p(radius), outline=stroke, width=p(1))
+    return out.resize((out.width // scale, out.height // scale), Image.Resampling.LANCZOS)
+
+
+def draw_iphone(source: Image.Image, address: str, light: bool, stylized: bool, shadow: bool) -> Image.Image:
+    screen_w, screen_h = 390, 844
+    bezel = 20 if not stylized else 14
+    frame_w, frame_h = screen_w + bezel * 2, screen_h + bezel * 2
+    margin = 76 if shadow else 24
+    out = Image.new("RGBA", (frame_w + margin * 2, frame_h + margin * 2), (0, 0, 0, 0))
+    rect = (margin, margin, margin + frame_w, margin + frame_h)
+    screen_rect = (margin + bezel, margin + bezel, margin + bezel + screen_w, margin + bezel + screen_h)
+
+    if shadow:
+        add_shadow(out, rect, 62, 110 if light else 170, 38, 20)
+
+    draw = ImageDraw.Draw(out)
+    screen = cover_resize(source, (screen_w, screen_h)).convert("RGBA")
+
+    if stylized:
+        paper = color("fbfbf8") if light else color("111317")
+        ink = color("20242a") if light else color("edf1f6")
+        muted = color("727780") if light else color("a6adb7")
+        draw.rounded_rectangle(rect, radius=58, fill=paper, outline=ink, width=3)
+        out.paste(screen, (screen_rect[0], screen_rect[1]), rounded_mask((screen_w, screen_h), 44))
+        draw.rounded_rectangle(screen_rect, radius=44, outline=ink, width=3)
+        notch = (margin + frame_w // 2 - 54, margin + bezel + 13, margin + frame_w // 2 + 54, margin + bezel + 43)
+        draw.rounded_rectangle(notch, radius=15, fill=paper, outline=ink, width=2)
+        bar = (screen_rect[0] + 38, screen_rect[3] - 64, screen_rect[2] - 38, screen_rect[3] - 22)
+        draw.rounded_rectangle(bar, radius=21, fill=paper, outline=ink, width=2)
+        text_fit(draw, address, screen_w - 120, 14, muted, ((bar[0] + bar[2]) / 2, (bar[1] + bar[3]) / 2))
+        return out
+
+    frame_fill = color("f7f7f8") if light else color("0c0d0f")
+    edge = color("cfd2d7") if light else color("292c31")
+    ui_fill = color("f9f9faee") if light else color("1c1d20ee")
+    ui_text = color("252a31") if light else color("f1f3f6")
+    draw.rounded_rectangle(rect, radius=64, fill=edge)
+    inner = (margin + 4, margin + 4, margin + frame_w - 4, margin + frame_h - 4)
+    draw.rounded_rectangle(inner, radius=60, fill=frame_fill)
+    out.paste(screen, (screen_rect[0], screen_rect[1]), rounded_mask((screen_w, screen_h), 44))
+    draw.rounded_rectangle(screen_rect, radius=44, outline=edge, width=1)
+    notch = (margin + frame_w // 2 - 58, margin + bezel + 11, margin + frame_w // 2 + 58, margin + bezel + 44)
+    draw.rounded_rectangle(notch, radius=17, fill=frame_fill)
+    draw.ellipse((notch[2] - 28, notch[1] + 10, notch[2] - 18, notch[1] + 20), fill=color("202329") if light else color("111214"))
+    bar = (screen_rect[0] + 28, screen_rect[3] - 74, screen_rect[2] - 28, screen_rect[3] - 24)
+    draw.rounded_rectangle(bar, radius=25, fill=ui_fill)
+    draw_icon(draw, "back", (bar[0] + 16, bar[1] + 14, bar[0] + 38, bar[1] + 36), ui_text, 2)
+    text_fit(draw, address, screen_w - 150, 14, ui_text, ((bar[0] + bar[2]) / 2, (bar[1] + bar[3]) / 2))
+    draw_icon(draw, "share", (bar[2] - 44, bar[1] + 11, bar[2] - 16, bar[1] + 39), ui_text, 2)
+    return out
+
+
+def default_output(source: Path, iphone: bool, stylized: bool, light: bool) -> Path:
+    parts = ["safari"]
+    if iphone:
+        parts.append("iphone")
+    parts.append("stylized" if stylized else "realistic")
+    parts.append("light" if light else "dark")
+    return source.with_name(source.name + "." + "-".join(parts) + ".png")
+
+
+def main() -> int:
+    args = parse_args()
+    source_path = Path(args.sourcefile)
+    if not source_path.exists():
+        print(f"browsershot: source file not found: {source_path}", file=sys.stderr)
+        return 2
+
+    try:
+        source = Image.open(source_path).convert("RGBA")
+    except Exception as exc:
+        print(f"browsershot: could not open image: {exc}", file=sys.stderr)
+        return 2
+
+    framed = (
+        draw_iphone(source, args.address, args.light, args.stylized, not args.no_shadow)
+        if args.iphone
+        else draw_safari(source, args.address, args.light, args.stylized, not args.no_shadow)
+    )
+    output_path = Path(args.output) if args.output else default_output(source_path, args.iphone, args.stylized, args.light)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    framed.save(output_path)
+    print(output_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

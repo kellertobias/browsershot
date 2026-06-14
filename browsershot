@@ -36,7 +36,7 @@ SF_SYMBOLS = {
 SF_SYMBOL_CACHE: dict[tuple[int, str], dict[str, Image.Image]] = {}
 MASK_KEYS = {"top", "right", "bottom", "left", "x", "y"}
 MASK_OPTIONS = {"--mask": "mask", "--imask": "imask"}
-VALUE_OPTIONS = {"--address", "--left", "--right", "--top", "--bottom", "--output", "-o"}
+VALUE_OPTIONS = {"--address", "--left", "--right", "--top", "--bottom", "--cursor", "--overlay", "--output", "-o"}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -68,6 +68,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="SPEC",
         nargs="+",
         help="Keep source image regions before framing, e.g. --imask top:720px left:1280px",
+    )
+    parser.add_argument(
+        "--overlay",
+        action="append",
+        default=[],
+        metavar="IMAGE,X,Y[,SCALE]",
+        help="Place an overlay image above browsers, e.g. --overlay dragoverlay.png,400,250,50%%",
+    )
+    parser.add_argument(
+        "--cursor",
+        action="append",
+        default=[],
+        metavar="X,Y",
+        help="Draw a macOS-style cursor above overlays, e.g. --cursor 500,300",
     )
     horizontal = parser.add_mutually_exclusive_group()
     horizontal.add_argument(
@@ -174,6 +188,101 @@ def non_negative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("pixel value must be 0 or greater")
     return parsed
+
+
+def parse_point(value: str, label: str) -> tuple[int, int]:
+    parts = value.split(",")
+    if len(parts) != 2:
+        raise ValueError(f"{label} must be formatted as x,y")
+    try:
+        x = int(parts[0])
+        y = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"{label} coordinates must be integers") from exc
+    if x < 0 or y < 0:
+        raise ValueError(f"{label} coordinates must be 0 or greater")
+    return x, y
+
+
+def parse_overlay_spec(value: str) -> tuple[Path, int, int, float]:
+    parts = value.split(",")
+    if len(parts) not in {3, 4}:
+        raise ValueError("overlay must be formatted as image,x,y[,scale]")
+    path = Path(parts[0])
+    try:
+        x = int(parts[1])
+        y = int(parts[2])
+    except ValueError as exc:
+        raise ValueError("overlay coordinates must be integers") from exc
+    if x < 0 or y < 0:
+        raise ValueError("overlay coordinates must be 0 or greater")
+
+    scale = 1.0
+    if len(parts) == 4:
+        raw_scale = parts[3]
+        if raw_scale.endswith("%"):
+            raw_scale = raw_scale[:-1]
+            try:
+                scale = float(raw_scale) / 100
+            except ValueError as exc:
+                raise ValueError(f"invalid overlay scale: {parts[3]!r}") from exc
+        else:
+            try:
+                scale = float(raw_scale)
+            except ValueError as exc:
+                raise ValueError(f"invalid overlay scale: {parts[3]!r}") from exc
+    if scale <= 0:
+        raise ValueError("overlay scale must be greater than 0")
+    return path, x, y, scale
+
+
+def expand_canvas(base: Image.Image, min_width: int, min_height: int) -> Image.Image:
+    if min_width <= base.width and min_height <= base.height:
+        return base
+    expanded = Image.new("RGBA", (max(base.width, min_width), max(base.height, min_height)), (0, 0, 0, 0))
+    expanded.alpha_composite(base)
+    return expanded
+
+
+def apply_overlays(base: Image.Image, specs: list[str]) -> Image.Image:
+    for spec in specs:
+        path, x, y, scale = parse_overlay_spec(spec)
+        if not path.exists():
+            raise ValueError(f"overlay image not found: {path}")
+        try:
+            overlay = Image.open(path).convert("RGBA")
+        except Exception as exc:
+            raise ValueError(f"could not open overlay image {path}: {exc}") from exc
+        if scale != 1.0:
+            size = (max(1, round(overlay.width * scale)), max(1, round(overlay.height * scale)))
+            overlay = overlay.resize(size, Image.Resampling.LANCZOS)
+        base = expand_canvas(base, x + overlay.width, y + overlay.height)
+        base.alpha_composite(overlay, (x, y))
+    return base
+
+
+def cursor_image() -> Image.Image:
+    scale = 8
+    outer_points = [(0.7, 0.6), (0.7, 17.8), (5.4, 13.3), (8.4, 20.0), (11.5, 18.8), (8.5, 12.2), (14.3, 12.2)]
+    inner_points = [(2.1, 3.9), (2.1, 15.4), (5.5, 11.6), (8.3, 17.6), (9.7, 17.0), (6.7, 10.5), (11.2, 10.5)]
+    high = Image.new("RGBA", (16 * scale, 22 * scale), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(high)
+    scaled_outer = [(x * scale, y * scale) for x, y in outer_points]
+    scaled_inner = [(x * scale, y * scale) for x, y in inner_points]
+    draw.polygon(scaled_outer, fill=color("ffffff"))
+    draw.polygon(scaled_inner, fill=color("050505"))
+    return high.resize((16, 22), Image.Resampling.LANCZOS)
+
+
+def apply_cursors(base: Image.Image, specs: list[str]) -> Image.Image:
+    if not specs:
+        return base
+    cursor = cursor_image()
+    for spec in specs:
+        x, y = parse_point(spec, "cursor")
+        base = expand_canvas(base, x + cursor.width, y + cursor.height)
+        base.alpha_composite(cursor, (x, y))
+    return base
 
 
 def mask_amount(value: str, dimension: int) -> int:
@@ -870,6 +979,12 @@ def main() -> int:
         )
 
     framed = stack_frames(frames, *stack_offset(args))
+    try:
+        framed = apply_overlays(framed, args.overlay)
+        framed = apply_cursors(framed, args.cursor)
+    except ValueError as exc:
+        print(f"browsershot: {exc}", file=sys.stderr)
+        return 2
     output_path = (
         Path(args.output)
         if args.output

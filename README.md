@@ -17,6 +17,7 @@ Defaults:
 - `--left <px>` and `--right <px>` are mutually exclusive
 - `--top <px>` and `--bottom <px>` are mutually exclusive
 - masks crop source images before the browser frame is generated
+- overlays render above the browser stack and below cursors
 
 Stack top-browser direction and spacing:
 
@@ -37,6 +38,17 @@ Masking:
 If `--mask` or `--imask` appears before any source file, it applies to all source files. If it appears after a source file, it applies only to that source file.
 
 Mask values can use bare pixels, `px`, or `%`. Supported mask keys are `top`, `right`, `bottom`, `left`, `x`, and `y`.
+
+Overlays and cursors:
+
+```sh
+./browsershot first.png second.png --overlay dragoverlay.png,400,250 --cursor 500,300
+./browsershot first.png --overlay dragoverlay.png,400,250,50%
+```
+
+Final output is layered as back browser, middle browsers, top browser, overlays, then cursors.
+
+Overlays use the top-left corner at `x,y` and preserve transparency. Cursor coordinates are also from the top-left of the final output.
 
 Example output:
 

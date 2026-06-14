@@ -199,8 +199,6 @@ def parse_point(value: str, label: str) -> tuple[int, int]:
         y = int(parts[1])
     except ValueError as exc:
         raise ValueError(f"{label} coordinates must be integers") from exc
-    if x < 0 or y < 0:
-        raise ValueError(f"{label} coordinates must be 0 or greater")
     return x, y
 
 
@@ -214,8 +212,6 @@ def parse_overlay_spec(value: str) -> tuple[Path, int, int, float]:
         y = int(parts[2])
     except ValueError as exc:
         raise ValueError("overlay coordinates must be integers") from exc
-    if x < 0 or y < 0:
-        raise ValueError("overlay coordinates must be 0 or greater")
 
     scale = 1.0
     if len(parts) == 4:
@@ -244,7 +240,26 @@ def expand_canvas(base: Image.Image, min_width: int, min_height: int) -> Image.I
     return expanded
 
 
-def apply_overlays(base: Image.Image, specs: list[str]) -> Image.Image:
+def paste_layer(base: Image.Image, layer: Image.Image, position: tuple[int, int]) -> tuple[Image.Image, tuple[int, int]]:
+    x, y = position
+    shift_x = max(0, -x)
+    shift_y = max(0, -y)
+    width = max(base.width + shift_x, x + shift_x + layer.width)
+    height = max(base.height + shift_y, y + shift_y + layer.height)
+    if shift_x or shift_y or width > base.width or height > base.height:
+        expanded = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        expanded.alpha_composite(base, (shift_x, shift_y))
+        base = expanded
+    base.alpha_composite(layer, (x + shift_x, y + shift_y))
+    return base, (shift_x, shift_y)
+
+
+def source_position(origin: tuple[int, int], scale: float, x: int, y: int) -> tuple[int, int]:
+    return (round(origin[0] + x * scale), round(origin[1] + y * scale))
+
+
+def apply_overlays(base: Image.Image, specs: list[str], source_origin: tuple[int, int], source_scale: float) -> tuple[Image.Image, tuple[int, int]]:
+    total_shift = (0, 0)
     for spec in specs:
         path, x, y, scale = parse_overlay_spec(spec)
         if not path.exists():
@@ -256,9 +271,10 @@ def apply_overlays(base: Image.Image, specs: list[str]) -> Image.Image:
         if scale != 1.0:
             size = (max(1, round(overlay.width * scale)), max(1, round(overlay.height * scale)))
             overlay = overlay.resize(size, Image.Resampling.LANCZOS)
-        base = expand_canvas(base, x + overlay.width, y + overlay.height)
-        base.alpha_composite(overlay, (x, y))
-    return base
+        base, shift = paste_layer(base, overlay, source_position(source_origin, source_scale, x, y))
+        total_shift = (total_shift[0] + shift[0], total_shift[1] + shift[1])
+        source_origin = (source_origin[0] + shift[0], source_origin[1] + shift[1])
+    return base, total_shift
 
 
 def cursor_image() -> Image.Image:
@@ -274,14 +290,14 @@ def cursor_image() -> Image.Image:
     return high.resize((16, 22), Image.Resampling.LANCZOS)
 
 
-def apply_cursors(base: Image.Image, specs: list[str]) -> Image.Image:
+def apply_cursors(base: Image.Image, specs: list[str], source_origin: tuple[int, int], source_scale: float) -> Image.Image:
     if not specs:
         return base
     cursor = cursor_image()
     for spec in specs:
         x, y = parse_point(spec, "cursor")
-        base = expand_canvas(base, x + cursor.width, y + cursor.height)
-        base.alpha_composite(cursor, (x, y))
+        base, shift = paste_layer(base, cursor, source_position(source_origin, source_scale, x, y))
+        source_origin = (source_origin[0] + shift[0], source_origin[1] + shift[1])
     return base
 
 
@@ -734,6 +750,35 @@ def safari_content_mask(frame_w: int, frame_h: int, toolbar_h: int, radius: int,
     return frame_mask.crop((0, toolbar_h * scale, frame_w * scale, frame_h * scale))
 
 
+def safari_source_transform(source: Image.Image, stylized: bool, shadow: bool) -> tuple[tuple[int, int], float]:
+    viewport_w = max(900, min(1800, source.width))
+    viewport_h = round(viewport_w * source.height / source.width)
+    viewport_h = max(520, min(1200, viewport_h))
+    toolbar_h = 64 if stylized else 54
+    margin = 84 if shadow else 28
+    fit_scale = min(viewport_w / source.width, viewport_h / source.height)
+    rendered_w = round(source.width * fit_scale)
+    rendered_h = round(source.height * fit_scale)
+    origin = (
+        margin + (viewport_w - rendered_w) // 2,
+        margin + toolbar_h + (viewport_h - rendered_h) // 2,
+    )
+    return origin, fit_scale
+
+
+def iphone_source_transform(source: Image.Image, stylized: bool, shadow: bool) -> tuple[tuple[int, int], float]:
+    screen_w, screen_h = 390, 844
+    bezel = 20 if not stylized else 14
+    margin = 76 if shadow else 24
+    fit_scale = max(screen_w / source.width, screen_h / source.height)
+    rendered_w = math.ceil(source.width * fit_scale)
+    rendered_h = math.ceil(source.height * fit_scale)
+    crop_left = (rendered_w - screen_w) // 2
+    crop_top = (rendered_h - screen_h) // 2
+    origin = (margin + bezel - crop_left, margin + bezel - crop_top)
+    return origin, fit_scale
+
+
 def draw_safari(source: Image.Image, address: str, light: bool, stylized: bool, shadow: bool) -> Image.Image:
     scale = 4
     sf_masks = {} if stylized else render_sf_symbol_masks(18 * scale)
@@ -923,9 +968,9 @@ def stack_offset(args: argparse.Namespace) -> tuple[int, int]:
     return 80 if offset_x is None else offset_x, 50 if offset_y is None else offset_y
 
 
-def stack_frames(frames: list[Image.Image], offset_x: int, offset_y: int) -> Image.Image:
+def stack_frames(frames: list[Image.Image], offset_x: int, offset_y: int) -> tuple[Image.Image, list[tuple[int, int]]]:
     if len(frames) == 1:
-        return frames[0]
+        return frames[0], [(0, 0)]
 
     raw_positions = [(index * -offset_x, index * -offset_y) for index in range(len(frames))]
     min_x = min(x for x, _y in raw_positions)
@@ -937,7 +982,7 @@ def stack_frames(frames: list[Image.Image], offset_x: int, offset_y: int) -> Ima
 
     for frame, position in reversed(list(zip(frames, positions))):
         out.alpha_composite(frame, position)
-    return out
+    return out, positions
 
 
 def default_output(source: Path, stacked: bool, iphone: bool, stylized: bool, light: bool) -> Path:
@@ -960,6 +1005,7 @@ def main() -> int:
             return 2
 
     frames = []
+    source_transforms = []
     for source_path, mask_ops in zip(source_paths, args.source_mask_ops):
         try:
             source = Image.open(source_path).convert("RGBA")
@@ -972,16 +1018,26 @@ def main() -> int:
             print(f"browsershot: invalid mask for {source_path}: {exc}", file=sys.stderr)
             return 2
 
-        frames.append(
-            draw_iphone(source, args.address, args.light, args.stylized, not args.no_shadow)
+        shadow = not args.no_shadow
+        source_transforms.append(
+            iphone_source_transform(source, args.stylized, shadow)
             if args.iphone
-            else draw_safari(source, args.address, args.light, args.stylized, not args.no_shadow)
+            else safari_source_transform(source, args.stylized, shadow)
+        )
+        frames.append(
+            draw_iphone(source, args.address, args.light, args.stylized, shadow)
+            if args.iphone
+            else draw_safari(source, args.address, args.light, args.stylized, shadow)
         )
 
-    framed = stack_frames(frames, *stack_offset(args))
+    framed, frame_positions = stack_frames(frames, *stack_offset(args))
+    top_source_origin, top_source_scale = source_transforms[0]
+    top_frame_position = frame_positions[0]
+    top_source_origin = (top_source_origin[0] + top_frame_position[0], top_source_origin[1] + top_frame_position[1])
     try:
-        framed = apply_overlays(framed, args.overlay)
-        framed = apply_cursors(framed, args.cursor)
+        framed, overlay_shift = apply_overlays(framed, args.overlay, top_source_origin, top_source_scale)
+        top_source_origin = (top_source_origin[0] + overlay_shift[0], top_source_origin[1] + overlay_shift[1])
+        framed = apply_cursors(framed, args.cursor, top_source_origin, top_source_scale)
     except ValueError as exc:
         print(f"browsershot: {exc}", file=sys.stderr)
         return 2

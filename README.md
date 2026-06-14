@@ -48,7 +48,7 @@ Overlays and cursors:
 
 Final output is layered as back browser, middle browsers, top browser, overlays, then cursors.
 
-Overlays use the top-left corner at `x,y` and preserve transparency. Cursor coordinates are also from the top-left of the final output.
+Overlay and cursor coordinates are measured from the top-left corner of the actual top source image inside the browser, not from the full output canvas. Negative coordinates move the layer above or left of that source image. Overlays preserve transparency.
 
 Example output:
 

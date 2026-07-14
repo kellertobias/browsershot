@@ -1,5 +1,7 @@
 # BrowserShot
 
+![BrowserShot desktop example](examples/mock-page.png.safari-realistic-light.png)
+
 BrowserShot wraps one or more existing screenshots or UI mockups in generated Safari/macOS browser frames or iPhone frames.
 
 It is useful when you already have an image of a webpage or product surface and want a polished browser/device presentation image without launching a browser.
@@ -24,17 +26,45 @@ examples/mock-page.png.safari-realistic-light.png
 
 ## Examples
 
-The `examples/mock-page.png` fixture is an intentionally fake webpage-style mockup generated for this repository. The framed screenshots below were produced with BrowserShot itself.
+The source images in `examples/` are intentionally fake webpage-style mockups generated for this repository. The framed screenshots below were produced with BrowserShot itself.
+
+### Desktop Safari
+
+Input:
 
 ![Mock page input](examples/mock-page.png)
 
-Desktop Safari frame:
+Output:
 
 ![BrowserShot desktop example](examples/mock-page.png.safari-realistic-light.png)
 
-iPhone frame:
+### iPhone Portrait
 
-![BrowserShot iPhone example](examples/mock-page.png.safari-iphone-stylized-light.png)
+The iPhone example uses a portrait source image so the content matches the device frame.
+
+```sh
+./browsershot examples/mobile-mock-page.png --address mobile.example --iphone --light --stylized
+```
+
+![BrowserShot iPhone portrait example](examples/mobile-mock-page.png.safari-iphone-stylized-light.png)
+
+### Stacked Screenshots, Cursor, and Overlay
+
+This example stacks two screenshots, adds a transparent overlay image, and draws a cursor at source-image coordinates.
+
+```sh
+./browsershot examples/mock-page.png examples/mock-page-secondary.png \
+  --address mock-product.example \
+  --light \
+  --scale 8% \
+  --right 150 \
+  --bottom 90 \
+  --overlay examples/overlay-callout.png,520,94 \
+  --cursor 690,540 \
+  --output examples/stacked-with-overlay.png
+```
+
+![BrowserShot stacked overlay example](examples/stacked-with-overlay.png)
 
 ## Usage
 
